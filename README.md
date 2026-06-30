@@ -1,120 +1,126 @@
-# zk-mixer — Stage 1: the circuit, proven locally
+# zk-mixer
 
-An **educational** zero-knowledge mixer. This repository exists to
-learn the circom / snarkjs / Groth16 toolchain and to demonstrate the ZK
-primitives behind a mixer (commitments, nullifiers, Merkle membership proofs).
+A from-scratch **zero-knowledge shielded pool** on Ethereum. Deposit a fixed
+amount behind a secret note, then withdraw to any address with a Groth16 proof
+that you own *a* deposit — without revealing *which* one. The link between
+depositor and recipient is never published on-chain.
 
-## ⚠️ Disclaimer — read this first
+**Live demo (Sepolia testnet):** https://zk-demo-testnet.vercel.app
 
-- **Educational and testnet-only.** Designed for Ethereum testnets (e.g. Sepolia)
-  with valueless test ETH. **Never deploy to mainnet. Never use with real funds.**
-- **Unaudited.** No security review. Assume bugs. Do not rely on it for any
-  privacy or security guarantee.
-- **Not legal or financial advice.** Privacy mixers occupy genuinely sensitive
-  legal territory — the Tornado Cash sanctions are real, recent history. This
-  project is a standalone learning exercise and is intentionally kept testnet-only.
-- **Trusted setup is local/single-party** (see below) — fine for a demo, **not
-  secure for real value.**
+> **Educational · testnet-only · unaudited.** Built to learn the circom /
+> snarkjs / Groth16 toolchain end to end. Runs only on the Sepolia testnet with
+> valueless test ETH. Not for mainnet, not for real funds, not legal or
+> financial advice.
+
+---
+
+## What it does
+
+A user deposits a fixed denomination (0.1 test ETH) along with a commitment
+`Poseidon(nullifier, secret)`. Later, they prove in zero knowledge that this
+commitment is a leaf in the pool's Merkle tree and withdraw to a fresh address,
+revealing only `nullifierHash = Poseidon(nullifier)` to prevent double-spends.
+Because many deposits share one pool, an observer cannot tell which deposit
+funded a given withdrawal — that crowd is the privacy (anonymity) set.
+
+The proof is generated **in the browser**; secrets never leave the user's machine.
+
+## Live deployment (Sepolia)
+
+| Contract | Address |
+|----------|---------|
+| Mixer (pool) | [`0x8377414ed2b56b4A9CD795fE8acb519B6E6A884A`](https://sepolia.etherscan.io/address/0x8377414ed2b56b4A9CD795fE8acb519B6E6A884A) |
+| Groth16 verifier | [`0x913347f34872A609EB9d08bCf540fD14301DfABA`](https://sepolia.etherscan.io/address/0x913347f34872A609EB9d08bCf540fD14301DfABA) |
+| Poseidon hasher | [`0xA836c683eB072d10bd4fC9bB3Bc2D2A19680531B`](https://sepolia.etherscan.io/address/0xA836c683eB072d10bd4fC9bB3Bc2D2A19680531B) |
+
+## Architecture
+
+    circuit (circom)  ──compile──▶  r1cs + wasm
+          │                              │
+     trusted setup (Groth16)        witness + proof (snarkjs, in browser)
+          │                              │
+     verification key            ┌───────┴────────┐
+          │                      │                │
+    Solidity verifier ◀──────────┘         Mixer pool contract
+    (auto-generated)                       ├─ incremental Poseidon Merkle tree
+                                           ├─ rolling root history
+                                           ├─ nullifier double-spend guard
+                                           └─ deposit() / withdraw()
+                                                    │
+                                           Next.js frontend
+                                           ├─ wallet connect (ethers v6)
+                                           ├─ deposit + note generation
+                                           └─ rebuild tree from events,
+                                              prove + withdraw
+
+The single most important invariant: the **Poseidon hash and Merkle format are
+identical** across the circuit, the JavaScript tree, and the on-chain tree. A
+parity test (`scripts/parity.test.js`) and a Hardhat test
+(`onchain/test/merkletree.test.js`) verify this — mismatched hashing is the
+classic failure where proofs verify locally but are rejected on-chain.
+
+## Tech stack
+
+- **Circuits:** circom 2, circomlib (Poseidon), Groth16 via snarkjs
+- **Contracts:** Solidity 0.8.20, Hardhat, ethers v6
+- **Hashing on-chain:** Poseidon contract deployed from circomlibjs bytecode
+- **Frontend:** Next.js (App Router), snarkjs WASM proving in-browser, Tailwind v4
+
+## Repository layout
+
+    circuits/withdraw.circom      the withdrawal circuit (depth-20 Merkle tree)
+    scripts/                      JS Merkle tree + parity test + input builder
+    setup.sh / prove.sh           trusted setup and local prove/verify
+    onchain/                      Hardhat project
+      contracts/Mixer.sol         the pool (deposit/withdraw)
+      contracts/MerkleTreeWithHistory.sol   incremental Poseidon tree
+      contracts/Verifier.sol      Groth16 verifier (generated)
+      test/                       Hardhat tests
+      scripts/deploy.js           deploy script
+    web/                          Next.js frontend
+
+## Run it locally
+
+**1. Circuit + local proof**
+
+    npm install
+    mkdir -p build
+    circom circuits/withdraw.circom --r1cs --wasm --sym -o build -l node_modules/circomlib/circuits
+    node scripts/parity.test.js      # expect: PARITY OK
+    ./setup.sh                        # trusted setup
+    ./prove.sh                        # expect: snarkJS: OK!
+
+(circom is installed via Rust: https://docs.circom.io/getting-started/installation/)
+
+**2. Contracts**
+
+    cd onchain
+    npm install
+    npx hardhat test                  # tree parity + full deposit/withdraw cycle
+    # to deploy, set onchain/.env (see .env.example), then:
+    npx hardhat run scripts/deploy.js --network sepolia
+
+**3. Frontend**
+
+    cd web
+    npm install
+    npm run dev                       # http://localhost:3000
 
 ## Honest note on the trusted setup
 
-Groth16 requires a **per-circuit trusted setup**. The setup produces secret
-randomness ("toxic waste"). The security property is: if **at least one** of the
-N participants in the setup ceremony honestly discards their entropy, an attacker
-cannot forge proofs. With a real multi-party ceremony, you only need one honest
-participant among many.
+Groth16 needs a per-circuit trusted setup. Its security relies on at least one
+participant destroying their secret randomness ("toxic waste"). `setup.sh` runs
+a **single-party local** ceremony, so the operator holds that randomness — fine
+for a testnet demo, **not** secure for real value, which would require a
+multi-party ceremony.
 
-This project runs a **solo, local, single-party** setup (`setup.sh`). That means
-**you** generate and hold all of the entropy. If that entropy leaked, someone
-could forge valid-looking withdrawal proofs. For a testnet demo with no real
-funds at stake, that is perfectly acceptable. For anything of value it is not —
-you would need a proper multi-contributor ceremony. Stating this plainly is part
-of doing the project honestly.
+## Security notes (educational)
 
-## What Stage 1 contains
+- Effects-before-interactions ordering in `withdraw()` (reentrancy-safe).
+- Nullifier marked spent before funds are sent; double-withdraw reverts.
+- `recipient`/`relayer`/`fee` are bound into the proof, so a relayer cannot
+  rewrite the recipient and re-broadcast.
+- Rolling history of recent roots so a withdrawal can use a recent root even if
+  more deposits arrive after the proof is built.
 
-| File | Purpose |
-|------|---------|
-| `circuits/withdraw.circom` | The withdrawal circuit (depth-20 Merkle tree). |
-| `scripts/merkleTree.js` | JS Poseidon Merkle tree — **matches the circuit bit-for-bit.** |
-| `scripts/generateInput.js` | Builds a sample `input.json` + secret `note.json`. |
-| `scripts/parity.test.js` | Proves JS Poseidon == circuit Poseidon (the #1 bug). |
-| `setup.sh` | Trusted setup: powers of tau → groth16 setup → vkey. |
-| `prove.sh` | Witness → proof → verify. |
-
-### The circuit (`Withdraw(20)`)
-
-- Private: `nullifier`, `secret`, `pathElements[20]`, `pathIndices[20]`
-- Public: `root`, `nullifierHash`, `recipient`, `relayer`, `fee`
-- Proves: `commitment = Poseidon(nullifier, secret)` is a leaf under `root`,
-  and `nullifierHash = Poseidon(nullifier)` — without revealing which leaf.
-- `recipient`/`relayer`/`fee` are **bound** into the proof (constrained via
-  squaring) so a relayer cannot rewrite the recipient and re-broadcast.
-
-**Public signal order** (this matters for the Stage 3 Solidity verifier):
-`[root, nullifierHash, recipient, relayer, fee]`.
-
-## The #1 bug, and how this repo guards against it
-
-The classic mixer failure is a **Poseidon / Merkle format mismatch**: the JS tree
-computes roots differently than the circuit expects, so proofs verify locally but
-fail on-chain (or never verify). `scripts/parity.test.js` guards against it by
-(a) recomputing the root from leaf+path by hand and (b) generating the circuit
-witness from JS-derived inputs and reading the circuit's own commitment back out,
-asserting it equals the JS commitment. **Run the parity test before anything else.**
-
-## Setup — installing circom
-
-circom is installed via Rust:
-
-```bash
-# Install Rust if you don't have it
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-
-# Build circom from source
-git clone https://github.com/iden3/circom.git
-cd circom
-cargo build --release
-cargo install --path circom        # puts `circom` on your PATH
-circom --version                   # expect: circom compiler 2.x
-cd ..
-```
-
-Then the JS deps:
-
-```bash
-npm install        # snarkjs, circomlib, circomlibjs
-```
-
-## Run Stage 1
-
-```bash
-# 1. Parity check — JS hashing must match the circuit. Run this first.
-npm run parity
-#    Expect: "PARITY OK: JS Merkle/Poseidon matches the circuit."
-
-# 2. Trusted setup (one-time; uses ~2^14 powers of tau for ~11k constraints).
-#    On a multi-core machine this takes a couple of minutes.
-npm run setup
-#    Produces build/keys/withdraw_final.zkey and build/keys/verification_key.json
-
-# 3. Prove + verify a sample withdrawal.
-npm run prove
-#    The last line must read:  [INFO]  snarkJS: OK!
-```
-
-### What success looks like
-
-- `npm run parity` ends with `PARITY OK: ...`.
-- `npm run prove` ends with `[INFO]  snarkJS: OK!` and prints the 5 public
-  signals in the order above.
-
-A passing `snarkJS: OK!` means: the circuit compiled, the trusted setup is valid,
-your JS Merkle tree matches the circuit, and a real Groth16 proof of membership
-verified. That is the Stage 1 milestone — a legitimate portfolio artifact on its
-own. Stages 2–4 (in-browser proving, contracts, frontend) build on this.
-
-> Note: depth-20 + power-14 trusted setup is CPU-heavy for snarkjs (single-threaded
-> JS). Use a multi-core machine. The included `circuits/withdraw_demo.circom`
-> (depth-4) runs the identical pipeline in seconds if you want a fast smoke test.
+This code is **unaudited** and intentionally testnet-only.
