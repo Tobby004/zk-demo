@@ -1,3 +1,7 @@
+// lib/zk.js — browser-side ZK helpers. Mirrors scripts/merkleTree.js from the
+// circuit project EXACTLY (same Poseidon, same ordering, same ZERO_VALUE), so
+// the proofs this app builds match the depth-20 circuit your keys were made for.
+
 import { buildPoseidon } from "circomlibjs";
 
 export const LEVELS = 20;
@@ -17,6 +21,7 @@ export async function getHasher() {
   return _hasher;
 }
 
+// Web Crypto random field element (browser-native; no Node 'crypto').
 export function randomFieldElement() {
   const bytes = new Uint8Array(31);
   crypto.getRandomValues(bytes);
@@ -97,6 +102,8 @@ export class MerkleTree {
   }
 }
 
+// Build a self-contained sample withdrawal input: a small in-memory tree with
+// a few deposits, ours among them, plus the matching circuit inputs.
 export async function buildSampleInput() {
   const hasher = await getHasher();
   const note = generateNote();
@@ -125,4 +132,43 @@ export async function buildSampleInput() {
   };
 
   return { input, privacySet: leaves.length, commitment };
+}
+
+// ---- Stage 4b: rebuild the tree from on-chain deposits and build a proof ----
+
+// Given the ordered list of leaf commitments (index 0..n-1) and our commitment,
+// return the membership proof inputs the circuit needs.
+export async function buildWithdrawInput(leaves, note, recipientField, relayerField, fee) {
+  const hasher = await getHasher();
+  const commitment = commitmentHash(hasher, note.nullifier, note.secret);
+
+  const myIndex = leaves.findIndex((l) => l === commitment);
+  if (myIndex === -1) {
+    throw new Error("Your commitment was not found in the pool's deposits.");
+  }
+
+  const tree = new MerkleTree(hasher, LEVELS, leaves);
+  const { root, pathElements, pathIndices } = tree.proof(myIndex);
+
+  const input = {
+    root,
+    nullifierHash: nullifierHash(hasher, note.nullifier),
+    recipient: recipientField,
+    relayer: relayerField,
+    fee: fee,
+    nullifier: note.nullifier,
+    secret: note.secret,
+    pathElements,
+    pathIndices,
+  };
+  return { input, root, leafIndex: myIndex };
+}
+
+// Parse a note string "<nullifier>-<secret>" back into an object.
+export function parseNote(noteString) {
+  const parts = noteString.trim().split("-");
+  if (parts.length !== 2 || !/^\d+$/.test(parts[0]) || !/^\d+$/.test(parts[1])) {
+    throw new Error("Invalid note format. Expected '<nullifier>-<secret>'.");
+  }
+  return { nullifier: parts[0], secret: parts[1] };
 }
