@@ -1,0 +1,9 @@
+{
+  "network": "sepolia",
+  "denomination": "100000000000000000",
+  "levels": 20,
+  "hasher": "0xA836c683eB072d10bd4fC9bB3Bc2D2A19680531B",
+  "verifier": "0x913347f34872A609EB9d08bCf540fD14301DfABA",
+  "mixer": "0x8377414ed2b56b4A9CD795fE8acb519B6E6A884A",
+  "deployedAt": "2026-06-30T09:42:49.638Z"
+}
