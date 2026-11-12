@@ -16,14 +16,50 @@ export function classifySet(unspent) {
   return SET_LEVELS.find((l) => unspent <= l.max) ?? SET_LEVELS[SET_LEVELS.length - 1];
 }
 
+// Turn ethers' nested errors into something readable. ethers often wraps the
+// node's real message ("block range too large", "rate limited", ...) inside a
+// generic "could not coalesce error".
+export function describeError(e) {
+  const nested = e?.info?.error?.message || e?.error?.message || e?.data?.message;
+  const top = e?.shortMessage || e?.reason || e?.message || String(e);
+  return nested && nested !== top ? `${top} — ${nested}` : top;
+}
+
+const MIN_SPAN = 1000; // don't split ranges smaller than this many blocks
+const MAX_REQUESTS = 250; // hard cap so a failing node can't be hammered
+
+async function queryRange(contract, filter, from, to, budget) {
+  if (budget.left <= 0) throw budget.lastError ?? new Error("Too many RPC retries while reading events");
+  budget.left -= 1;
+  try {
+    return await contract.queryFilter(filter, from, to);
+  } catch (e) {
+    budget.lastError = e;
+    // Can't split any further: surface the real error.
+    if (to - from < MIN_SPAN) throw e;
+    // Many RPCs reject big ranges or big result sets. Split and retry each half.
+    const mid = Math.floor((from + to) / 2);
+    const left = await queryRange(contract, filter, from, mid, budget);
+    const right = await queryRange(contract, filter, mid + 1, to, budget);
+    return left.concat(right);
+  }
+}
+
+// Fetch all events matching `filter`, from `fromBlock` to the latest block.
+// Fast path: one request. If the node rejects it, it adapts by splitting.
+export async function fetchEvents(contract, filter, fromBlock = 0) {
+  const provider = contract.runner?.provider ?? contract.runner;
+  const latest = await provider.getBlockNumber();
+  if (fromBlock > latest) return [];
+  return queryRange(contract, filter, fromBlock, latest, { left: MAX_REQUESTS, lastError: null });
+}
+
 // `mixer` is an ethers Contract whose ABI includes the Deposit and Withdrawal
-// events. `fromBlock` lets you skip blocks before deployment (faster, and
-// friendlier to RPC providers that cap log ranges).
+// events. `fromBlock` lets you skip blocks before deployment.
 export async function getPoolStats(mixer, fromBlock = 0) {
-  const [deposits, withdrawals] = await Promise.all([
-    mixer.queryFilter(mixer.filters.Deposit(), fromBlock),
-    mixer.queryFilter(mixer.filters.Withdrawal(), fromBlock),
-  ]);
+  // Sequential on purpose: two parallel log queries can trip rate limits.
+  const deposits = await fetchEvents(mixer, mixer.filters.Deposit(), fromBlock);
+  const withdrawals = await fetchEvents(mixer, mixer.filters.Withdrawal(), fromBlock);
 
   const totalDeposits = deposits.length;
   const totalWithdrawals = withdrawals.length;

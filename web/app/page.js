@@ -4,7 +4,7 @@ import { useState } from "react";
 import * as snarkjs from "snarkjs";
 import { connectWallet, getMixer } from "@/lib/contract";
 import { MIXER_ADDRESS, DEPLOY_BLOCK } from "@/lib/config";
-import { getPoolStats } from "@/lib/stats";
+import { getPoolStats, fetchEvents, describeError } from "@/lib/stats";
 import {
   getHasher,
   generateNote,
@@ -181,7 +181,7 @@ export default function Home() {
     try {
       setStats(await getPoolStats(getMixer(w.provider), DEPLOY_BLOCK));
     } catch (e) {
-      setStatsError("Could not load pool stats: " + (e?.shortMessage || e?.message || String(e)));
+      setStatsError("Could not load pool stats: " + describeError(e));
     } finally {
       setStatsLoading(false);
     }
@@ -240,7 +240,7 @@ export default function Home() {
       const mixer = getMixer(wallet.signer);
 
       setWStatus("Reading deposits from the chain");
-      const events = await mixer.queryFilter(mixer.filters.Deposit(), DEPLOY_BLOCK);
+      const events = await fetchEvents(mixer, mixer.filters.Deposit(), DEPLOY_BLOCK);
       const ordered = events
         .map((e) => ({ leafIndex: Number(e.args.leafIndex), commitment: e.args.commitment.toString() }))
         .sort((a, b) => a.leafIndex - b.leafIndex);
