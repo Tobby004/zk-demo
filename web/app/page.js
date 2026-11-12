@@ -3,7 +3,8 @@
 import { useState } from "react";
 import * as snarkjs from "snarkjs";
 import { connectWallet, getMixer } from "@/lib/contract";
-import { MIXER_ADDRESS } from "@/lib/config";
+import { MIXER_ADDRESS, DEPLOY_BLOCK } from "@/lib/config";
+import { getPoolStats } from "@/lib/stats";
 import {
   getHasher,
   generateNote,
@@ -78,6 +79,82 @@ function Step({ n, title, body }) {
   );
 }
 
+/* ---------- live pool panel: deposits, withdrawals, effective anonymity set ---------- */
+// Full class names (not built dynamically) so Tailwind keeps them.
+const TONE = {
+  danger: { badge: "text-danger border-danger/40 bg-danger/10", dot: "bg-danger" },
+  warn: { badge: "text-warn border-warn/40 bg-warn/10", dot: "bg-warn" },
+  ok: { badge: "text-accent border-accent/40 bg-accent/10", dot: "bg-accent" },
+};
+
+function Stat({ label, value, strong }) {
+  return (
+    <div>
+      <div className="font-mono text-[11px] text-muted mb-1">{label}</div>
+      <div className={`font-mono text-2xl ${strong ? "text-accent text-glow" : "text-fg"}`}>{value}</div>
+    </div>
+  );
+}
+
+function PoolPanel({ stats, loading, error, onRefresh }) {
+  const tone = stats ? TONE[stats.level.tone] : null;
+  // One dot per deposit (capped), teal = still unspent, hollow = already withdrawn.
+  const MAX_DOTS = 32;
+  const shown = stats ? Math.min(stats.totalDeposits, MAX_DOTS) : 0;
+  const spentShown = stats && stats.totalDeposits > 0
+    ? Math.round((stats.totalWithdrawals / stats.totalDeposits) * shown)
+    : 0;
+
+  return (
+    <div className="card rounded-xl p-6 mb-5">
+      <div className="flex items-center justify-between mb-5">
+        <h3 className="font-mono text-lg">Pool</h3>
+        <button onClick={onRefresh} disabled={loading}
+          className="font-mono text-xs rounded border border-border px-3 py-1.5 hover:border-accent transition disabled:opacity-50">
+          {loading ? "Loading…" : "Refresh"}
+        </button>
+      </div>
+
+      {error && <p className="font-mono text-xs text-danger">{error}</p>}
+
+      {!stats && !error && <p className="font-mono text-xs text-muted cursor">Reading events from the chain</p>}
+
+      {stats && (
+        <>
+          <div className="grid grid-cols-3 gap-4 mb-5">
+            <Stat label="deposits" value={stats.totalDeposits} />
+            <Stat label="withdrawn" value={stats.totalWithdrawals} />
+            <Stat label="anonymity set" value={stats.unspent} strong />
+          </div>
+
+          {shown > 0 && (
+            <div className="flex flex-wrap gap-1.5 mb-5" aria-label={`${stats.unspent} of ${stats.totalDeposits} deposits unspent`}>
+              {Array.from({ length: shown }).map((_, i) => {
+                const spent = i < spentShown;
+                return (
+                  <span key={i}
+                    className={`h-2.5 w-2.5 rounded-full border ${spent ? "border-border bg-transparent" : "border-accent bg-accent"}`} />
+                );
+              })}
+              {stats.totalDeposits > MAX_DOTS && <span className="font-mono text-[10px] text-muted ml-1">+{stats.totalDeposits - MAX_DOTS} more</span>}
+            </div>
+          )}
+
+          <div className={`rounded-lg border p-3 ${tone.badge}`}>
+            <p className="font-mono text-xs mb-1">{stats.level.label.toUpperCase()}</p>
+            <p className="text-xs text-muted leading-relaxed">{stats.level.note}</p>
+          </div>
+
+          <p className="font-mono text-[11px] text-muted mt-4 leading-relaxed">
+            anonymity set = deposits not yet withdrawn. Observers can&apos;t tell which deposits were spent,
+            only how many, so this is the real size of the crowd a new withdrawal hides in.
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
 export default function Home() {
   const [wallet, setWallet] = useState(null);
   const [denom, setDenom] = useState(null);
@@ -92,13 +169,34 @@ export default function Home() {
   const [wStatus, setWStatus] = useState("");
   const [wBusy, setWBusy] = useState(false);
   const [wTx, setWTx] = useState(null);
-  const [privacySet, setPrivacySet] = useState(null);
+
+  const [stats, setStats] = useState(null);
+  const [statsLoading, setStatsLoading] = useState(false);
+  const [statsError, setStatsError] = useState("");
+
+  async function loadStats(w = wallet) {
+    if (!w || !w.onSepolia) return;
+    setStatsLoading(true);
+    setStatsError("");
+    try {
+      setStats(await getPoolStats(getMixer(w.provider), DEPLOY_BLOCK));
+    } catch (e) {
+      setStatsError("Could not load pool stats: " + (e?.shortMessage || e?.message || String(e)));
+    } finally {
+      setStatsLoading(false);
+    }
+  }
 
   async function onConnect() {
     try {
       const w = await connectWallet();
       setWallet(w);
-      setDenom(await getMixer(w.provider).denomination());
+      // Only talk to the contract once we know we're on Sepolia; on any other
+      // chain there is no contract at this address and the call would fail.
+      if (w.onSepolia) {
+        setDenom(await getMixer(w.provider).denomination());
+        loadStats(w);
+      }
     } catch (e) {
       setStatus("Error: " + (e?.message || String(e)));
     }
@@ -120,6 +218,7 @@ export default function Home() {
       });
       setTxHash(tx.hash);
       setStatus("Deposit confirmed");
+      loadStats();
     } catch (e) {
       setStatus("Error: " + (e?.reason || e?.message || String(e)));
     } finally { setBusy(false); }
@@ -141,12 +240,11 @@ export default function Home() {
       const mixer = getMixer(wallet.signer);
 
       setWStatus("Reading deposits from the chain");
-      const events = await mixer.queryFilter(mixer.filters.Deposit());
+      const events = await mixer.queryFilter(mixer.filters.Deposit(), DEPLOY_BLOCK);
       const ordered = events
         .map((e) => ({ leafIndex: Number(e.args.leafIndex), commitment: e.args.commitment.toString() }))
         .sort((a, b) => a.leafIndex - b.leafIndex);
       const leaves = ordered.map((o) => o.commitment);
-      setPrivacySet(leaves.length);
 
       setWStatus("Building Merkle proof and zero-knowledge proof");
       const recipientField = BigInt(recipientAddr).toString();
@@ -163,6 +261,7 @@ export default function Home() {
       await tx.wait();
       setWTx(tx.hash);
       setWStatus("Withdrawal confirmed — funds sent");
+      loadStats();
     } catch (e) {
       setWStatus("Error: " + (e?.reason || e?.message || String(e)));
     } finally { setWBusy(false); }
@@ -238,53 +337,57 @@ export default function Home() {
         )}
 
         {wallet && !wrongNet && (
-          <div className="grid md:grid-cols-2 gap-5">
-            {/* DEPOSIT */}
-            <div className="card rounded-xl p-6">
-              <div className="flex items-baseline justify-between mb-5">
-                <h3 className="font-mono text-lg">Deposit</h3>
-                <span className="font-mono text-sm text-accent">{denom ? formatEther(denom) : "—"} ETH</span>
-              </div>
-              <button onClick={onDeposit} disabled={busy}
-                className={`w-full font-mono text-sm rounded-md py-3 transition ${busy ? "bg-surface-2 text-muted" : "btn-accent"}`}>
-                {busy ? "Working…" : `Deposit ${denom ? formatEther(denom) : ""} ETH`}
-              </button>
-              {status && <p className={`font-mono text-xs mt-4 ${status.startsWith("Error") ? "text-danger" : "text-muted cursor"}`}>{status}</p>}
+          <>
+            <PoolPanel stats={stats} loading={statsLoading} error={statsError} onRefresh={() => loadStats()} />
 
-              {note && (
-                <div className="mt-5 rounded-lg border border-warn/40 bg-warn/5 p-4">
-                  <p className="font-mono text-xs text-warn mb-2">⚠ SAVE THIS NOTE — the only key to withdraw</p>
-                  <textarea readOnly value={note.string} onFocus={(e) => e.target.select()}
-                    className="w-full h-14 bg-surface-2 border border-border rounded p-2 font-mono text-[11px] text-fg resize-none" />
-                  <div className="flex gap-2 mt-2">
-                    <button onClick={() => navigator.clipboard.writeText(note.string)} className="font-mono text-xs rounded border border-border px-3 py-1.5 hover:border-accent transition">Copy</button>
-                    <button onClick={downloadNote} className="font-mono text-xs rounded border border-border px-3 py-1.5 hover:border-accent transition">Download</button>
-                  </div>
-                  {txHash && <a href={`https://sepolia.etherscan.io/tx/${txHash}`} target="_blank" rel="noreferrer" className="block font-mono text-xs text-accent mt-3 hover:underline">view on Etherscan ↗</a>}
+            <div className="grid md:grid-cols-2 gap-5">
+              {/* DEPOSIT */}
+              <div className="card rounded-xl p-6">
+                <div className="flex items-baseline justify-between mb-5">
+                  <h3 className="font-mono text-lg">Deposit</h3>
+                  <span className="font-mono text-sm text-accent">{denom ? formatEther(denom) : "—"} ETH</span>
                 </div>
-              )}
-            </div>
+                <button onClick={onDeposit} disabled={busy}
+                  className={`w-full font-mono text-sm rounded-md py-3 transition ${busy ? "bg-surface-2 text-muted" : "btn-accent"}`}>
+                  {busy ? "Working…" : `Deposit ${denom ? formatEther(denom) : ""} ETH`}
+                </button>
+                {status && <p className={`font-mono text-xs mt-4 ${status.startsWith("Error") ? "text-danger" : "text-muted cursor"}`}>{status}</p>}
 
-            {/* WITHDRAW */}
-            <div className="card rounded-xl p-6">
-              <div className="flex items-baseline justify-between mb-5">
-                <h3 className="font-mono text-lg">Withdraw</h3>
-                {privacySet != null && <span className="font-mono text-xs text-muted">privacy set: <span className="text-accent">{privacySet}</span></span>}
+                {note && (
+                  <div className="mt-5 rounded-lg border border-warn/40 bg-warn/5 p-4">
+                    <p className="font-mono text-xs text-warn mb-2">⚠ SAVE THIS NOTE — the only key to withdraw</p>
+                    <textarea readOnly value={note.string} onFocus={(e) => e.target.select()}
+                      className="w-full h-14 bg-surface-2 border border-border rounded p-2 font-mono text-[11px] text-fg resize-none" />
+                    <div className="flex gap-2 mt-2">
+                      <button onClick={() => navigator.clipboard.writeText(note.string)} className="font-mono text-xs rounded border border-border px-3 py-1.5 hover:border-accent transition">Copy</button>
+                      <button onClick={downloadNote} className="font-mono text-xs rounded border border-border px-3 py-1.5 hover:border-accent transition">Download</button>
+                    </div>
+                    {txHash && <a href={`https://sepolia.etherscan.io/tx/${txHash}`} target="_blank" rel="noreferrer" className="block font-mono text-xs text-accent mt-3 hover:underline">view on Etherscan ↗</a>}
+                  </div>
+                )}
               </div>
-              <label className="block font-mono text-xs text-muted mb-1">note</label>
-              <textarea value={wNote} onChange={(e) => setWNote(e.target.value)} placeholder="<nullifier>-<secret>"
-                className="w-full h-14 bg-surface-2 border border-border rounded p-2 font-mono text-[11px] mb-3 resize-none focus:border-accent outline-none" />
-              <label className="block font-mono text-xs text-muted mb-1">recipient</label>
-              <input value={recipient} onChange={(e) => setRecipient(e.target.value)} placeholder="0x… any address"
-                className="w-full bg-surface-2 border border-border rounded p-2 font-mono text-xs mb-4 focus:border-accent outline-none" />
-              <button onClick={onWithdraw} disabled={wBusy}
-                className={`w-full font-mono text-sm rounded-md py-3 transition ${wBusy ? "bg-surface-2 text-muted" : "btn-accent"}`}>
-                {wBusy ? "Proving…" : "Generate proof & withdraw"}
-              </button>
-              {wStatus && <p className={`font-mono text-xs mt-4 ${wStatus.startsWith("Error") ? "text-danger" : "text-muted cursor"}`}>{wStatus}</p>}
-              {wTx && <a href={`https://sepolia.etherscan.io/tx/${wTx}`} target="_blank" rel="noreferrer" className="block font-mono text-xs text-accent mt-3 hover:underline">view on Etherscan ↗</a>}
+
+              {/* WITHDRAW */}
+              <div className="card rounded-xl p-6">
+                <div className="flex items-baseline justify-between mb-5">
+                  <h3 className="font-mono text-lg">Withdraw</h3>
+                  {stats && <span className="font-mono text-xs text-muted">anonymity set: <span className="text-accent">{stats.unspent}</span></span>}
+                </div>
+                <label className="block font-mono text-xs text-muted mb-1">note</label>
+                <textarea value={wNote} onChange={(e) => setWNote(e.target.value)} placeholder="<nullifier>-<secret>"
+                  className="w-full h-14 bg-surface-2 border border-border rounded p-2 font-mono text-[11px] mb-3 resize-none focus:border-accent outline-none" />
+                <label className="block font-mono text-xs text-muted mb-1">recipient</label>
+                <input value={recipient} onChange={(e) => setRecipient(e.target.value)} placeholder="0x… any address"
+                  className="w-full bg-surface-2 border border-border rounded p-2 font-mono text-xs mb-4 focus:border-accent outline-none" />
+                <button onClick={onWithdraw} disabled={wBusy}
+                  className={`w-full font-mono text-sm rounded-md py-3 transition ${wBusy ? "bg-surface-2 text-muted" : "btn-accent"}`}>
+                  {wBusy ? "Proving…" : "Generate proof & withdraw"}
+                </button>
+                {wStatus && <p className={`font-mono text-xs mt-4 ${wStatus.startsWith("Error") ? "text-danger" : "text-muted cursor"}`}>{wStatus}</p>}
+                {wTx && <a href={`https://sepolia.etherscan.io/tx/${wTx}`} target="_blank" rel="noreferrer" className="block font-mono text-xs text-accent mt-3 hover:underline">view on Etherscan ↗</a>}
+              </div>
             </div>
-          </div>
+          </>
         )}
       </section>
 

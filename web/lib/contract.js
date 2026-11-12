@@ -10,6 +10,7 @@ export const MIXER_ABI = [
   "function isSpent(uint256 nullifierHash) view returns (bool)",
   "function nextIndex() view returns (uint32)",
   "event Deposit(uint256 indexed commitment, uint32 leafIndex, uint256 timestamp)",
+  "event Withdrawal(address to, uint256 nullifierHash, address indexed relayer, uint256 fee)",
 ];
 
 export async function connectWallet() {
